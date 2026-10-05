@@ -304,3 +304,99 @@ def test_a_ticker_or_date_given_twice_runs_and_settles_once(tmp_path):
     graph = _FakeGraph.instances[-1]
     assert graph.calls == [("NVDA", "2026-01-05")]
     assert graph.settled == ["NVDA"]
+
+
+# --- google backtest model resolution ----------------------------------------
+# With TRADINGAGENTS_LLM_PROVIDER=google and no per-tier model override, the
+# backtest must not carry the built-in OpenAI IDs anywhere: the graph builds
+# every agent (including the Sentiment Analyst) from the two tier LLMs, so a
+# gpt-6-luna leak into any tier 404s against the Gemini endpoint for all cells.
+
+_GOOGLE_QUICK = "gemini-3.5-flash-lite"
+_GOOGLE_DEEP = "gemini-3.8-flash"
+_OPENAI_BUILTINS = ("gpt-6-luna", "gpt-6-sol")
+
+
+def _google_env(monkeypatch, **extra):
+    monkeypatch.setenv("TRADINGAGENTS_LLM_PROVIDER", "google")
+    monkeypatch.delenv("TRADINGAGENTS_QUICK_THINK_LLM", raising=False)
+    monkeypatch.delenv("TRADINGAGENTS_DEEP_THINK_LLM", raising=False)
+    for key, value in extra.items():
+        monkeypatch.setenv(key, value)
+
+
+@pytest.mark.unit
+def test_google_backtest_config_reaches_the_graph_without_openai_models(tmp_path, monkeypatch):
+    """The actual run_backtest path hands the graph Gemini models, without OPENAI_API_KEY."""
+    _google_env(monkeypatch)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    config = {**_config(tmp_path), "llm_provider": "google",
+              "quick_think_llm": "gpt-6-luna", "deep_think_llm": "gpt-6-sol"}
+
+    run_backtest(["NVDA"], ["2026-01-05"], config)
+
+    graph_config = _FakeGraph.instances[-1].config
+    assert graph_config["quick_think_llm"] == _GOOGLE_QUICK
+    assert graph_config["deep_think_llm"] == _GOOGLE_DEEP
+    assert all(v not in _OPENAI_BUILTINS for v in graph_config.values() if isinstance(v, str))
+
+
+@pytest.mark.unit
+def test_google_backtest_tier_models_are_gemini(tmp_path, monkeypatch):
+    """Direct construction check: the tier LLMs every agent shares — including
+    the Sentiment Analyst's — are Gemini, with no OPENAI_API_KEY present."""
+    import tradingagents.graph.setup as setup_module
+    from tradingagents.backtest import resolve_backtest_config
+    from tradingagents.graph.trading_graph import TradingAgentsGraph
+
+    _google_env(monkeypatch)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    seen = {}
+    real_factory = setup_module.create_sentiment_analyst
+
+    def _capture(llm):
+        seen["sentiment_model"] = getattr(llm, "model", getattr(llm, "model_name", None))
+        return real_factory(llm)
+
+    monkeypatch.setattr(setup_module, "create_sentiment_analyst", _capture)
+    from tradingagents.default_config import build_default_config
+    base = build_default_config()
+    base.update({"results_dir": str(tmp_path / "results"),
+                 "data_cache_dir": str(tmp_path / "cache"),
+                 "memory_log_path": str(tmp_path / "live_trading_memory.md")})
+    config = resolve_backtest_config(base)
+    graph = TradingAgentsGraph(["market", "social", "news", "fundamentals"], config=config)
+
+    assert graph.quick_thinking_llm.model == _GOOGLE_QUICK
+    assert graph.deep_thinking_llm.model == _GOOGLE_DEEP
+    assert seen["sentiment_model"] == _GOOGLE_QUICK
+
+
+@pytest.mark.unit
+def test_explicit_model_overrides_survive_a_google_backtest(tmp_path, monkeypatch):
+    """TRADINGAGENTS_QUICK/DEEP_THINK_LLM still win over the Google defaults."""
+    _google_env(monkeypatch, TRADINGAGENTS_QUICK_THINK_LLM="my-quick", TRADINGAGENTS_DEEP_THINK_LLM="my-deep")
+    config = {**_config(tmp_path), "llm_provider": "google",
+              "quick_think_llm": "gpt-6-luna", "deep_think_llm": "gpt-6-sol"}
+
+    run_backtest(["NVDA"], ["2026-01-05"], config)
+
+    graph_config = _FakeGraph.instances[-1].config
+    assert graph_config["quick_think_llm"] == "my-quick"
+    assert graph_config["deep_think_llm"] == "my-deep"
+
+
+@pytest.mark.unit
+def test_non_google_backtest_keeps_its_models(tmp_path, monkeypatch):
+    """The resolution only applies to Google; other providers are untouched."""
+    monkeypatch.setenv("TRADINGAGENTS_LLM_PROVIDER", "openai")
+    monkeypatch.delenv("TRADINGAGENTS_QUICK_THINK_LLM", raising=False)
+    monkeypatch.delenv("TRADINGAGENTS_DEEP_THINK_LLM", raising=False)
+    config = {**_config(tmp_path), "llm_provider": "openai",
+              "quick_think_llm": "gpt-6-luna", "deep_think_llm": "gpt-6-sol"}
+
+    run_backtest(["NVDA"], ["2026-01-05"], config)
+
+    graph_config = _FakeGraph.instances[-1].config
+    assert graph_config["quick_think_llm"] == "gpt-6-luna"
+    assert graph_config["deep_think_llm"] == "gpt-6-sol"

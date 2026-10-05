@@ -339,14 +339,36 @@ def _select_model(provider: str, mode: str, default=None) -> str:
     return choice
 
 
+def _automatic_model(provider, mode, default, beginner_model, env_var):
+    """Beginner-mode default without prompting; env override still wins."""
+    env = os.environ.get(env_var)
+    if env:
+        return env
+    if (provider or "").lower() == "google":
+        return beginner_model
+    if default and default != "custom":
+        try:
+            if default in {v for _, v in get_model_options(provider, mode)}:
+                return default
+        except KeyError:
+            pass
+    try:
+        for _, value in get_model_options(provider, mode):
+            if value != "custom":
+                return value
+    except KeyError:
+        pass
+    return default or beginner_model
+
+
 def select_shallow_thinking_agent(provider, default=None) -> str:
-    """Select shallow thinking llm engine using an interactive selection."""
-    return _select_model(provider, "quick", default)
+    """Beginner mode: automatic quick model (no prompt)."""
+    return _automatic_model(provider, "quick", default, "gemini-3.5-flash-lite", "TRADINGAGENTS_QUICK_THINK_LLM")
 
 
 def select_deep_thinking_agent(provider, default=None) -> str:
-    """Select deep thinking llm engine using an interactive selection."""
-    return _select_model(provider, "deep", default)
+    """Beginner mode: automatic deep model (no prompt)."""
+    return _automatic_model(provider, "deep", default, "gemini-3.8-flash", "TRADINGAGENTS_DEEP_THINK_LLM")
 
 
 def _llm_provider_table() -> list[tuple[str, str, str | None]]:

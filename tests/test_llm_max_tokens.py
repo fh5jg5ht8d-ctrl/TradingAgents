@@ -115,3 +115,33 @@ def test_env_override_sets_config(monkeypatch):
     config = _config_with_env(monkeypatch, TRADINGAGENTS_MAX_TOKENS="8192")
     assert config["max_tokens"] == "8192"
     assert _coerce_max_tokens(config["max_tokens"]) == 8192
+
+
+# --- groq backtest budget (8,000 TPM) ------------------------------------------
+# The Groq-backed backtest caps per-request output so input + output fit the
+# provider's TPM limit. Both tiers must carry the cap; construction alone must
+# not need network access.
+
+
+@pytest.mark.unit
+def test_forwarded_as_max_tokens_for_groq():
+    kwargs = build_llm_kwargs({"llm_provider": "groq", "max_tokens": 2048})
+    assert kwargs["max_tokens"] == 2048
+    assert "max_output_tokens" not in kwargs
+
+
+@pytest.mark.unit
+def test_groq_backtest_tiers_carry_the_cap(monkeypatch):
+    """Both backtest tiers forward the configured output cap (no network)."""
+    from tradingagents.llm_clients.factory import create_tier_client
+
+    config = _config_with_env(
+        monkeypatch,
+        TRADINGAGENTS_LLM_PROVIDER="groq",
+        TRADINGAGENTS_QUICK_THINK_LLM="openai/gpt-oss-20b",
+        TRADINGAGENTS_DEEP_THINK_LLM="openai/gpt-oss-120b",
+        TRADINGAGENTS_MAX_TOKENS="2048",
+    )
+    for tier in ("quick", "deep"):
+        client = create_tier_client(config, tier)
+        assert client.kwargs.get("max_tokens") == 2048

@@ -17,6 +17,7 @@ cell rather than a position carried forward.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -73,6 +74,49 @@ def _alpha(entry: dict) -> float | None:
         return float(text) / 100
     except ValueError:
         return None
+
+
+# Provider defaults used when the backtest inherits the built-in OpenAI model
+# IDs while running on another provider. Mirrors the interactive selection's
+# beginner defaults (cli/selections.py): with TRADINGAGENTS_LLM_PROVIDER=google
+# and no per-tier model override, quick runs gemini-3.5-flash-lite and deep
+# runs gemini-3.8-flash. Explicit TRADINGAGENTS_*_THINK_LLM overrides always win.
+_GOOGLE_QUICK_DEFAULT = "gemini-3.5-flash-lite"
+_GOOGLE_DEEP_DEFAULT = "gemini-3.8-flash"
+# The built-in OpenAI model IDs that must never survive into a Google backtest
+# unless the user explicitly asked for them via the model env vars.
+_OPENAI_QUICK_DEFAULT = "gpt-6-luna"
+_OPENAI_DEEP_DEFAULT = "gpt-6-sol"
+
+
+def resolve_backtest_config(config: dict) -> dict:
+    """Return a copy of ``config`` with provider-consistent backtest models.
+
+    When the run provider is Google and neither per-tier model env var is set,
+    the built-in OpenAI defaults are replaced with the Google beginner
+    defaults (quick ``gemini-3.5-flash-lite``, deep ``gemini-3.8-flash``).
+    Any explicit model env override or non-default model choice is preserved.
+    """
+    resolved = dict(config)
+    # Honor the current environment even if the caller passed a stale
+    # DEFAULT_CONFIG snapshot taken before the env vars were set.
+    provider_env = os.environ.get("TRADINGAGENTS_LLM_PROVIDER")
+    if provider_env:
+        resolved["llm_provider"] = provider_env
+    for env_var, key in (("TRADINGAGENTS_QUICK_THINK_LLM", "quick_think_llm"),
+                         ("TRADINGAGENTS_DEEP_THINK_LLM", "deep_think_llm")):
+        raw = os.environ.get(env_var)
+        if raw:
+            resolved[key] = raw
+    if str(resolved.get("llm_provider", "")).lower() != "google":
+        return resolved
+    if not os.environ.get("TRADINGAGENTS_QUICK_THINK_LLM"):
+        if resolved.get("quick_think_llm") == _OPENAI_QUICK_DEFAULT:
+            resolved["quick_think_llm"] = _GOOGLE_QUICK_DEFAULT
+    if not os.environ.get("TRADINGAGENTS_DEEP_THINK_LLM"):
+        if resolved.get("deep_think_llm") == _OPENAI_DEEP_DEFAULT:
+            resolved["deep_think_llm"] = _GOOGLE_DEEP_DEFAULT
+    return resolved
 
 
 @dataclass
@@ -148,6 +192,7 @@ def run_backtest(
     run_id = safe_ticker_component(run_id or datetime.now().strftime("%Y%m%d_%H%M%S"))
     run_dir = Path(config["results_dir"]) / "backtest" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    config = resolve_backtest_config(config)
     run_config = {**config, "results_dir": str(run_dir),
                   "memory_log_path": str(run_dir / "trading_memory.md")}
 

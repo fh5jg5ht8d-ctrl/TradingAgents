@@ -12,6 +12,7 @@ from cli.announcements import display_announcements, fetch_announcements
 from cli.display import (
     console,
 )
+from cli.models import AnalystType
 from cli.prefs import load_last_run, sanitize, save_last_run
 from cli.prompts import (
     ask_anthropic_effort,
@@ -19,11 +20,11 @@ from cli.prompts import (
     ask_glm_region,
     ask_minimax_region,
     ask_openai_reasoning_effort,
-    ask_output_language,
     ask_qwen_region,
     confirm_ollama_endpoint,
     detect_asset_type,
     ensure_api_key,
+    filter_analysts_for_asset_type,
     get_ticker,
     parse_analysis_date,
     parse_analysts,
@@ -53,18 +54,14 @@ def depth_from_env() -> bool:
 
 
 def unattended_gaps(flags) -> list[str]:
-    """The flags and environment variables a run with no terminal still needs."""
-    env = os.environ.get
-    gaps = [f"--{name}" for name in ("ticker", "date", "analysts") if flags.get(name) is None]
-    gaps += [f"--{name} or --no-{name}" for name in ("save", "show") if flags.get(name) is None]
-    if not env("TRADINGAGENTS_OUTPUT_LANGUAGE"):
-        gaps.append("TRADINGAGENTS_OUTPUT_LANGUAGE")
+    """The flags and environment variables a run with no terminal still needs.
+
+    Beginner mode is automatic for everything except ticker, date, and
+    research depth, so only those can still block an unattended run.
+    """
+    gaps = [f"--{name}" for name in ("ticker", "date") if flags.get(name) is None]
     if not depth_from_env():
         gaps.append("TRADINGAGENTS_MAX_DEBATE_ROUNDS and TRADINGAGENTS_MAX_RISK_ROUNDS")
-    if not env("TRADINGAGENTS_LLM_PROVIDER"):
-        gaps.append("TRADINGAGENTS_LLM_PROVIDER")
-    if not (env("TRADINGAGENTS_QUICK_THINK_LLM") or env("TRADINGAGENTS_DEEP_THINK_LLM")):
-        gaps.append("TRADINGAGENTS_QUICK_THINK_LLM or TRADINGAGENTS_DEEP_THINK_LLM")
     return gaps
 
 
@@ -102,6 +99,12 @@ def _from_flag(parse, value, *args):
 
 def _prompt_selections(prefs, flags):
     """Walk the selection steps. ``prefs`` prefills; flags and the environment skip."""
+    # Beginner defaults: save the report, the HTML page, and the on-screen
+    # report unless the user explicitly passed --save/--no-save,
+    # --html/--no-html, or --show/--no-show.
+    flags.setdefault("save", True)
+    flags.setdefault("html", True)
+    flags.setdefault("show", True)
     with open(Path(__file__).parent / "static" / "welcome.txt", encoding="utf-8") as f:
         welcome_ascii = f.read()
 
@@ -185,32 +188,25 @@ def _prompt_selections(prefs, flags):
         )
         analysis_date = get_analysis_date()
 
-    # Step 3: Output language (skipped when set via TRADINGAGENTS_OUTPUT_LANGUAGE)
+    # Beginner default: English (skipped when set via TRADINGAGENTS_OUTPUT_LANGUAGE).
+    # The env overlay on DEFAULT_CONFIG already applies the override.
+    output_language = DEFAULT_CONFIG["output_language"]
     if os.environ.get("TRADINGAGENTS_OUTPUT_LANGUAGE"):
-        output_language = DEFAULT_CONFIG["output_language"]
         console.print(
             f"[green]✓ Output language from environment:[/green] {output_language}"
         )
     else:
-        console.print(
-            create_question_box(
-                "Step 3: Output Language",
-                "Select the language for analyst reports and final decision"
-            )
-        )
-        output_language = ask_output_language(prefs.get("output_language"))
+        console.print(f"[green]✓ Output language:[/green] {output_language}")
 
-    # Step 4: Select analysts
+    # Beginner default: all analysts the asset type allows (flag still wins).
     prefs = sanitize(prefs, asset_type.value)
     if flags.get("analysts") is not None:
         selected_analysts = _from_flag(parse_analysts, flags["analysts"], asset_type)
     else:
-        console.print(
-            create_question_box(
-                "Step 4: Analysts Team", "Select your LLM analyst agents for the analysis"
-            )
+        selected_analysts = filter_analysts_for_asset_type(
+            [AnalystType.MARKET, AnalystType.SOCIAL, AnalystType.NEWS, AnalystType.FUNDAMENTALS],
+            asset_type,
         )
-        selected_analysts = select_analysts(asset_type, prefs.get("analysts"))
     console.print(
         f"[green]Selected analysts:[/green] {', '.join(analyst.value for analyst in selected_analysts)}"
     )
@@ -234,10 +230,7 @@ def _prompt_selections(prefs, flags):
         )
         selected_research_depth = select_research_depth(prefs.get("research_depth"))
 
-    # Step 6: LLM Provider (skipped when set via TRADINGAGENTS_LLM_PROVIDER).
-    # The backend URL comes from TRADINGAGENTS_LLM_BACKEND_URL when set,
-    # otherwise the provider's default endpoint — the same value the menu
-    # would have picked.
+    # Beginner default: Google Gemini (env override still wins).
     provider_from_env = bool(os.environ.get("TRADINGAGENTS_LLM_PROVIDER"))
     if provider_from_env:
         selected_llm_provider = DEFAULT_CONFIG["llm_provider"].lower()
@@ -247,45 +240,16 @@ def _prompt_selections(prefs, flags):
         console.print(f"[green]✓ LLM provider from environment:[/green] {selected_llm_provider}")
         console.print(f"[green]✓ Backend URL:[/green] {backend_url}")
     else:
-        console.print(
-            create_question_box(
-                "Step 6: LLM Provider", "Select your LLM provider"
-            )
-        )
-        selected_llm_provider, backend_url = select_llm_provider(prefs.get("llm_provider"))
-
-        # Providers with regional endpoints prompt for the region as a secondary
-        # step so the main dropdown stays clean (mainland China and international
-        # accounts cannot share API keys).
-        if selected_llm_provider == "qwen":
-            selected_llm_provider, backend_url = ask_qwen_region()
-        elif selected_llm_provider == "minimax":
-            selected_llm_provider, backend_url = ask_minimax_region()
-        elif selected_llm_provider == "glm":
-            selected_llm_provider, backend_url = ask_glm_region()
-
-        # Honor an explicit env backend URL even when the provider was chosen
-        # interactively, so it isn't overwritten by the menu default (#978).
+        selected_llm_provider = "google"
         backend_url = resolve_backend_url(
-            selected_llm_provider, backend_url, env_url=DEFAULT_CONFIG["backend_url"]
+            selected_llm_provider, env_url=DEFAULT_CONFIG["backend_url"]
         )
-
-        # The generic OpenAI-compatible endpoint has no default; ask for it if
-        # neither the menu nor the environment supplied one.
-        if selected_llm_provider == "openai_compatible" and not backend_url:
-            remembered_url = (prefs.get("backend_url")
-                              if prefs.get("llm_provider") == selected_llm_provider else None)
-            backend_url = prompt_openai_compatible_url(remembered_url)
-
-        # For Ollama, surface the resolved endpoint (OLLAMA_BASE_URL vs default)
-        # before model selection so it's obvious where we're connecting.
-        if selected_llm_provider == "ollama":
-            confirm_ollama_endpoint(backend_url)
+        console.print(f"[green]✓ LLM provider:[/green] {selected_llm_provider}")
 
 
     _check_tier_providers(selected_llm_provider)
 
-    # Step 7: Thinking agents (skipped when either model is set via environment)
+    # Beginner defaults: sensible Gemini models (env overrides still win).
     if os.environ.get("TRADINGAGENTS_QUICK_THINK_LLM") or os.environ.get("TRADINGAGENTS_DEEP_THINK_LLM"):
         selected_shallow_thinker = DEFAULT_CONFIG["quick_think_llm"]
         selected_deep_thinker = DEFAULT_CONFIG["deep_think_llm"]
@@ -293,25 +257,25 @@ def _prompt_selections(prefs, flags):
             f"[green]✓ Thinking agents from environment:[/green] "
             f"quick={selected_shallow_thinker}, deep={selected_deep_thinker}"
         )
-    else:
+    elif selected_llm_provider.lower() == "google":
+        selected_shallow_thinker = "gemini-3.5-flash-lite"
+        selected_deep_thinker = "gemini-3.8-flash"
         console.print(
-            create_question_box(
-                "Step 7: Thinking Agents", "Select your thinking agents for analysis"
-            )
+            f"[green]✓ Thinking agents:[/green] "
+            f"quick={selected_shallow_thinker}, deep={selected_deep_thinker}"
         )
-        remembered = prefs if prefs.get("llm_provider") == selected_llm_provider else {}
-        selected_shallow_thinker = select_shallow_thinking_agent(
-            selected_llm_provider, remembered.get("quick_think_llm")
-        )
-        selected_deep_thinker = select_deep_thinking_agent(
-            selected_llm_provider, remembered.get("deep_think_llm")
+    else:
+        # An env-chosen non-Google provider: stay non-interactive by using the
+        # configured models rather than prompting.
+        selected_shallow_thinker = DEFAULT_CONFIG["quick_think_llm"]
+        selected_deep_thinker = DEFAULT_CONFIG["deep_think_llm"]
+        console.print(
+            f"[green]✓ Thinking agents:[/green] "
+            f"quick={selected_shallow_thinker}, deep={selected_deep_thinker}"
         )
 
-    # Step 8: Provider-specific reasoning/thinking configuration. Each knob is
-    # settable via its TRADINGAGENTS_* env var; when that var is set (or the
-    # provider itself came from env) the prompt is skipped and the configured
-    # value is used — same env-precedence rule as the steps above. None = each
-    # provider's own default.
+    # Beginner default: each provider's own default (no prompt). Env overrides
+    # via TRADINGAGENTS_* still apply through DEFAULT_CONFIG.
     thinking_level = None
     reasoning_effort = None
     anthropic_effort = None
@@ -321,24 +285,9 @@ def _prompt_selections(prefs, flags):
         thinking_level = DEFAULT_CONFIG["google_thinking_level"]
         reasoning_effort = DEFAULT_CONFIG["openai_reasoning_effort"]
         anthropic_effort = DEFAULT_CONFIG["anthropic_effort"]
-    elif provider_lower == "google":
-        thinking_level = thinking_value_or_prompt(
-            "TRADINGAGENTS_GOOGLE_THINKING_LEVEL", "google_thinking_level",
-            "Gemini thinking mode", "Step 8: Thinking Mode",
-            "Configure Gemini thinking mode", ask_gemini_thinking_config,
-        )
-    elif provider_lower == "openai":
-        reasoning_effort = thinking_value_or_prompt(
-            "TRADINGAGENTS_OPENAI_REASONING_EFFORT", "openai_reasoning_effort",
-            "Reasoning effort", "Step 8: Reasoning Effort",
-            "Configure OpenAI reasoning effort level", ask_openai_reasoning_effort,
-        )
-    elif provider_lower == "anthropic":
-        anthropic_effort = thinking_value_or_prompt(
-            "TRADINGAGENTS_ANTHROPIC_EFFORT", "anthropic_effort",
-            "Claude effort", "Step 8: Effort Level",
-            "Configure Claude effort level", ask_anthropic_effort,
-        )
+    elif provider_lower == "google" and os.environ.get("TRADINGAGENTS_GOOGLE_THINKING_LEVEL"):
+        thinking_level = DEFAULT_CONFIG["google_thinking_level"]
+        console.print(f"[green]✓ Gemini thinking mode from environment:[/green] {thinking_level}")
 
     return {
         "ticker": selected_ticker,

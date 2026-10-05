@@ -429,7 +429,14 @@ def _offer_reports(final_state, graph, ticker, save=None, show=None, html=None):
     answering the save question at the prompt is also asked about the page and
     offered to open it; a run whose flags answer the save question asks neither.
     """
-    asked = save is None
+    # Beginner defaults: automatic save/HTML/show; explicit flags still win.
+    if save is None:
+        save = True
+    if html is None:
+        html = True
+    if show is None:
+        show = True
+    asked = False
     if asked:
         save = typer.prompt("Save report?", default="Y").strip().upper() in ("Y", "YES", "")
     if save:
